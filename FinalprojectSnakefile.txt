@@ -1,0 +1,615 @@
+
+#-----------------------------------------------------
+# Importing necessary modules.
+#-----------------------------------------------------
+import sys
+import os
+import re
+
+
+#--------------------------------------------------------
+# Displaying Welcome introductory message to user.
+#--------------------------------------------------------
+print(r"""
+     ____           _             ____              _        
+    / ___|__ _ _ __| |__   __ _  / ___| _ __   __ _| | _____ 
+   | |   / _` | '__| '_ \ / _` | \___ \| '_ \ / _` | |/ / _ \
+   | |__| (_| | |  | |_) | (_| |  ___) | | | | (_| |   <  __/
+    \____\__,_|_|  |_.__/ \__,_| |____/|_| |_|\__,_|_|\_\___|
+"""
+)
+print("""
+       ╔════════════════════════════════════════════════════╗
+       ║ Welcome to CarbaSnake🐍                            ║
+       ║ An automated Snakemake pipeline for the analysis of║
+       ║ Carbapenemase Producing Enterobacterales (CPE's)🦠 ║
+       ╚════════════════════════════════════════════════════╝
+
+        📦 Main features and tools employed in this pipeline:   
+          🧫 Quality checking of reads = FastQC and MultiQC
+
+          ✂️  Trimming of Sequencing adaptors = Trimmomatic
+
+          🧩 Assembly of reads = SPAdes
+
+          🧠 Taxonomic classification of microrganism = Kraken2
+
+          🔬 Detection of contamination = CheckM
+
+          🧬 Detection and classification of resistance genes = AMRFinderPlus
+
+          🔎 Identification of plasmids = PlasmidFinder
+
+          🔢 Sequence typing = mlst (Torsten seeman)
+
+          📄 Virulence gene detection = ABRicate
+
+""")
+
+#===============================
+#	Workflow begins
+#===============================
+
+#----------------------------------------------------------------------------------------
+#       Checking for .fastq files needed as input for
+#       Quality Control tools. This first warning is applied
+#       to ensure that .fastq files exist in the /data folder.
+#----------------------------------------------------------------------------------------
+#Using wildcards to automatically generate tupules of lists for forward and reverse reads
+forward_fastq_files, = glob_wildcards("data/{sample}_1.fastq.gz")
+reverse_fastq_files, = glob_wildcards("data/{sample}_2.fastq.gz")
+all_samples = forward_fastq_files + reverse_fastq_files
+
+
+#Want to give the user a warning if their is no .fastq files placed in the /data folder.
+#Creating the variable all_PE_fastq_files to store concatenation of forward and reverse reads.
+
+
+if len(all_samples) == 0:
+    print("""
+                                ⚠️  WARNING⚠️
+          ❌ There are no .fastq files being detected in the data folder❌
+          Please ensure that:
+          ⇨ Your paired-end read files are placed in the data folder.
+          ⇨ They are in the format sample_1.fastq.gz for the forward read
+            and sample_2.fastq.gz for the reverse read.
+          ⇨ Ensure you are running your run_carbasnake --cores 8 command in the same folder
+            which contains the Snakefiles and /data folder.
+            Exiting the program""")
+    sys.exit(1)
+
+#--------------------------------------------------------------
+# Check pairing of forward/reverse files
+#--------------------------------------------------------------
+#-----------------------------------------------------------------------------
+#        Check if input files in /data folder are paired-end reads.
+#        Only valid paired-end samples will continue through
+#        the workfow.
+#----------------------------------------------------------------------------- 
+#Logic for the use of with open and other similar write out commands adapted from : https://www.w3schools.com/python/python_file_write.asp
+#List append logic adapted from: https://www.w3schools.com/python/ref_list_append.asp
+
+#Defining empty lists 
+#paired_end_samples variable stores valid paired-end samples (ie. samples that have both a forward and reverse .fastq file.) 
+#incomplete_samples variable stores invalid samples (ie. samples which are missing either a forward or reverse .fastq file).
+paired_end_samples = []
+incomplete_samples = []
+
+for sample in all_samples:
+        if sample in reverse_fastq_files and sample in forward_fastq_files:
+                paired_end_samples.append(sample)
+        else:
+                incomplete_samples.append(sample)
+
+if incomplete_samples:
+    print("""
+                                ⚠️  WARNING ⚠️
+        ❌ Some of the samples present in the data folder are incomplete. ❌
+                        
+           Each sample in the data folder must have:
+           ⇨ A file containing forward reads for the sample in the format sample_1.fastq
+           ⇨ A file containing reverse reads for the sample in the format sample_2.fastq
+
+           Please ensure that:
+          ⇨ All paired-end sample files are placed in the data folder..
+          ⇨ Files follow the correct naming convention:
+           -sample_1.fastq.gz for forward reads.
+            -sample_2.fastq.gz for reverse reads.
+        ⇨ Ensure that all samples have both files present with matching sample names.
+
+        Samples deemed as incomplete will be excluded from further analysis and are listed in 
+        the following text file...
+
+        ⇨ incomplete_samples_before_trimming.txt
+
+        The pipeline will now continue to process valid paired-end read samples only.
+    """)
+
+#Writing names of incomplete samples to the following text file.
+
+    with open("incomplete_samples_before_trimming.txt", "w") as log_of_incomplete_samples:
+        for sample in incomplete_samples:
+            log_of_incomplete_samples.write(sample + "\n")
+
+fastq_files = sorted(set(paired_end_samples))
+
+
+#--------------------------------------------------------------------------------------------
+# Specifying rule all directive to explicitly tell snakemake all of the output files required.
+#--------------------------------------------------------------------------------------------
+rule all:
+    input:
+        # QC and preprocessing steps for all samples
+        expand("Quality_Control/{sample}_1_paired_fastqc.html", sample=fastq_files),
+        expand("Quality_Control/{sample}_2_paired_fastqc.html", sample=fastq_files),
+        expand("Quality_Control/{sample}_1_paired_fastqc.zip",  sample=fastq_files),
+        expand("Quality_Control/{sample}_2_paired_fastqc.zip",  sample=fastq_files),
+        "Quality_Control/multiqc_summary_report.html",
+        expand("trimmed/{sample}_1_paired.fastq.gz",   sample=fastq_files),
+        expand("trimmed/{sample}_1_unpaired.fastq.gz", sample=fastq_files),
+        expand("trimmed/{sample}_2_paired.fastq.gz",   sample=fastq_files),
+        expand("trimmed/{sample}_2_unpaired.fastq.gz", sample=fastq_files),
+        expand("assembly/{sample}/contigs.fasta",      sample=fastq_files),
+        expand("qc/seqkit/{sample}.stats.tsv",         sample=fastq_files),
+        expand("qc/{sample}.mean_cov.txt",             sample=fastq_files),
+
+        # This file is produced by the checkpoint rule
+        "qc/good_samples.txt",
+        "qc/bad_samples.txt",
+
+        # Downstream rules that should run only for good samples
+        expand("kraken2/{sample}.kraken",             sample=lambda wildcards: get_good_samples()),
+        expand("kraken2/{sample}.report",             sample=lambda wildcards: get_good_samples()),
+        expand("checkm/{sample}/checkm_summary.tsv",  sample=lambda wildcards: get_good_samples()),
+        expand("mlst/{sample}.mlst.tsv",              sample=lambda wildcards: get_good_samples()),
+        expand("amrfinder/{sample}.amrfinder.tsv",    sample=lambda wildcards: get_good_samples()),
+        expand("abricate/ncbi/{sample}.tsv",          sample=lambda wildcards: get_good_samples()),
+        expand("abricate/resfinder/{sample}.tsv",     sample=lambda wildcards: get_good_samples()),
+        expand("abricate/vfdb/{sample}.tsv",          sample=lambda wildcards: get_good_samples()),
+        expand("abricate/card/{sample}.tsv",          sample=lambda wildcards: get_good_samples()),
+        expand("abricate/plasmidfinder/{sample}.tsv", sample=lambda wildcards: get_good_samples())
+
+
+# -----------------------------------------------------------------------------
+# Optional user-triggered rule: Run FastQC on raw reads
+# ----------------------------------------------------------------------------
+#This rule is seperate from the main worflow and can be triggered by typing snakemake
+#fastqcraw on the command line. This rule is in place in case a user would prefer to 
+#examine the quality of the fastq files they have before trimming.
+#FastQC on raw reads logic adopted from 
+#https://farm.cse.ucdavis.edu/~ctbrown/2023-snakemake-book-draft/section_3.html
+
+rule fastqcraw:
+    message: "Running FastQC on raw reads (user-triggered)"
+    input:
+        expand("Raw_FastQC_files_before_trimming/{sample}_1_fastqc.html", sample=fastq_files),
+        expand("Raw_FastQC_files_before_trimming/{sample}_2_fastqc.html", sample=fastq_files)
+
+# -----------------------------------------------------------------------------
+# Rule: Run FastQC on raw paired-end reads
+# -----------------------------------------------------------------------------
+#Rule logic adapted from: https://farm.cse.ucdavis.edu/~ctbrown/2023-snakemake-book-draft/section_3.html
+#and https://github.com/AAFC-BICoE/snakemake-trimmomatic/blob/master/Snakefile
+
+rule fastqc_raw_reads:
+    message: "🔬 Running FastQC on raw reads before trimming"
+    input:
+        forward_read = "data/{sample}_1.fastq.gz",
+        reverse_read = "data/{sample}_2.fastq.gz"
+    output:
+        forward_read_html = "Raw_FastQC_files_before_trimming/{sample}_1_fastqc.html",
+        reverse_read_html = "Raw_FastQC_files_before_trimming/{sample}_2_fastqc.html",
+        forward_read_zip = "Raw_FastQC_files_before_trimming/{sample}_1_fastqc.zip",
+        reverse_read_zip = "Raw_FastQC_files_before_trimming/{sample}_2_fastqc.zip"
+    threads: 3
+    shell: """
+        mkdir -p Raw_FastQC_files_before_trimming
+        fastqc {input.forward_read} {input.reverse_read} \
+            --threads {threads} \
+            --outdir Raw_FastQC_files_before_trimming
+    """
+
+#---------------------------------------------------------------------------------
+#                 Trimmomatic for the removal of potential adaptor contamination 
+#                 or low quality reads
+#-----------------------------------------------------------------------------------
+#The TruSeq3 adaptor file required for this rule is present in the 
+#CarbaSnake directory.
+#ILLUMINACLIP settings adapted from: http://www.usadellab.org/cms/?page=trimmomatic
+#Rule logic adapted from: https://gist.github.com/conchoecia/d48da395d7b5d48a9c16c5eb6a9874e3
+
+rule trimmomatic:
+    message: "🧹 Trimming {wildcards.sample} with Trimmomatic"
+    input:
+        r1 = "data/{sample}_1.fastq.gz",
+        r2 = "data/{sample}_2.fastq.gz"
+    output:
+        r1_paired    = "trimmed/{sample}_1_paired.fastq.gz",
+        r1_unpaired  = "trimmed/{sample}_1_unpaired.fastq.gz",
+        r2_paired    = "trimmed/{sample}_2_paired.fastq.gz",
+        r2_unpaired  = "trimmed/{sample}_2_unpaired.fastq.gz"
+    threads: 8
+    params:
+        adapters = "/home/localuser/bioinformatics/CarbaSnake/adapter/TruSeq3-PE-2.fa"
+    shell: """
+        mkdir -p trimmed
+        trimmomatic PE \
+            -threads {threads} \
+            {input.r1} {input.r2} \
+            {output.r1_paired} {output.r1_unpaired} \
+            {output.r2_paired} {output.r2_unpaired} \
+            ILLUMINACLIP:{params.adapters}:2:30:10 \
+            LEADING:3 TRAILING:3 SLIDINGWINDOW:4:20 MINLEN:36
+    """
+
+
+
+
+#--------------------------------------------------------------
+# Flag fully trimmed-out samples
+#--------------------------------------------------------------
+#30 byte threshold header based on standard empty gzip file sizes 
+#https://www.loc.gov/preservation/digital/formats/fdd/fdd000599.shtml?loclr=blogsig
+#Getting the size of a specified path adopted from: 
+#https://www.geeksforgeeks.org/python/python-os-path-size-method/
+rule check_fully_trimmed_out:
+
+    """
+    Writes `fully_trimmed_out_samples.txt` listing samples whose forward *and*
+    reverse paired files are effectively empty (no reads after trimming).
+    """
+    input:
+        r1 = expand("trimmed/{sample}_1_paired.fastq.gz", sample=fastq_files),
+        r2 = expand("trimmed/{sample}_2_paired.fastq.gz", sample=fastq_files)
+    output:
+        "fully_trimmed_out_samples.txt"
+    run:
+        import os
+
+        EMPTY_THRESHOLD = 30  
+
+        fully_trimmed = [
+            s
+            for s in fastq_files
+            if os.path.getsize(f"trimmed/{s}_1_paired.fastq.gz") < EMPTY_THRESHOLD
+            and os.path.getsize(f"trimmed/{s}_2_paired.fastq.gz") < EMPTY_THRESHOLD
+        ]
+
+        if fully_trimmed:
+            print(f"⚠️  {len(fully_trimmed)} sample(s) were fully trimmed out.")
+
+        with open(output[0], "w") as fh:
+            fh.writelines(f"{s}\n" for s in fully_trimmed)
+
+#----------------------------------------------------------
+# FastQC for quality control analysis of trimmed reads
+#---------------------------------------------------------- 
+rule fastqc_trimmed:
+    message: "Running FastQC on trimmed reads."
+    input:
+        forward_read = "trimmed/{sample}_1_paired.fastq.gz",
+        reverse_read = "trimmed/{sample}_2_paired.fastq.gz"
+    output:
+        forward_read_html = "Quality_Control/{sample}_1_paired_fastqc.html",
+        reverse_read_html = "Quality_Control/{sample}_2_paired_fastqc.html",
+        forward_read_zip = "Quality_Control/{sample}_1_paired_fastqc.zip",
+        reverse_read_zip = "Quality_Control/{sample}_2_paired_fastqc.zip",
+    threads: 3
+    shell: """
+        mkdir -p Quality_Control
+        fastqc {input.forward_read} --outdir Quality_Control --threads {threads}
+        fastqc {input.reverse_read} --outdir Quality_Control --threads {threads}
+    """
+#--------------------------------------------------------------
+# MultiQC for aggregation and reporting of FastQC results
+#--------------------------------------------------------------
+#Rule logic adapted from: https://farm.cse.ucdavis.edu/~ctbrown/2023-snakemake-book-draft/section_3.html
+
+rule multiqc:
+    message: "📊 Generating MultiQC report"
+    input:
+        expand("Quality_Control/{sample}_1_paired_fastqc.zip", sample=fastq_files) + \
+        expand("Quality_Control/{sample}_2_paired_fastqc.zip", sample=fastq_files)
+    output:
+        "Quality_Control/multiqc_summary_report.html"
+    shell:
+        """
+        multiqc Quality_Control --filename {output:q} -f
+        """
+
+#--------------------------------------------------------------
+# SPAdes assembly
+#--------------------------------------------------------------
+#Rule logic adapted from: https://github.com/tanaes/snakemake_assemble/blob/master/bin/snakefiles/assemble
+#and https://gitlab.rc.uab.edu/CCTS-Informatics-Pipelines/Snakemake-Spades-Pipeline/-/blob/master/Snakefile
+
+
+rule spades_assembly:
+    message: "🧩 Assembling reads with SPAdes"
+    input:
+        fwd = "trimmed/{sample}_1_paired.fastq.gz",
+        rev = "trimmed/{sample}_2_paired.fastq.gz"
+    output:
+        contigs = "assembly/{sample}/contigs.fasta"
+    threads: 8
+    shell:
+        """
+        mkdir -p assembly/{wildcards.sample}
+        spades.py \
+            --phred-offset 33 \
+            --pe1-1 {input.fwd} \
+            --pe1-2 {input.rev} \
+            -o assembly/{wildcards.sample} \
+            -t {threads}
+        """
+#============================
+#Seqkit stats calculation 
+#============================
+
+
+
+rule seqkit_stats:
+    input:
+        "assembly/{sample}/contigs.fasta"
+    output:
+        "qc/seqkit/{sample}.stats.tsv"
+    shell:
+        r"""
+        mkdir -p qc/seqkit
+        seqkit stats --all -T {input} > {output}
+        """
+
+rule calc_mean_cov:
+    input:
+        fasta = "assembly/{sample}/contigs.fasta",
+        r1    = "trimmed/{sample}_1_paired.fastq.gz",
+        r2    = "trimmed/{sample}_2_paired.fastq.gz"
+    output:
+        cov   = "qc/{sample}.mean_cov.txt"
+    shell: """
+        mkdir -p qc
+
+        #Counting seqkit stat bases 
+        bases1=$(seqkit stats -T {input.r1} | awk 'NR==2 {{print $5}}')
+        bases2=$(seqkit stats -T {input.r2} | awk 'NR==2 {{print $5}}')
+        total_bases=$((bases1 + bases2))
+
+        #Determining genomize size from contigs
+        genome_size=$(seqkit stats -T {input.fasta} | awk 'NR==2 {{print $5}}')
+
+        #Calculating based on Landerman Waterman
+        if [ "$genome_size" -gt 0 ]; then
+            coverage=$(echo "scale=2; $total_bases / $genome_size" | bc)
+            printf "%.2f\n" "$coverage" > {output.cov}
+        else
+            echo "0.00" > {output.cov}
+        fi
+    """
+
+
+# Coverage thresholds rule
+N50_HARD = 10000
+COV_HARD = 30
+
+checkpoint filter_samples:
+    message: "📋 Filtering samples with mean coverage ≥ 30 and N50 ≥ 10,000"
+    input:
+        mean_cov = expand("qc/{sample}.mean_cov.txt",    sample=fastq_files),
+        stats    = expand("qc/seqkit/{sample}.stats.tsv", sample=fastq_files),
+    output:
+        good = "qc/good_samples.txt",
+        bad  = "qc/bad_samples.txt"
+    run: #making empty lists
+   
+        good = []
+        bad  = []
+
+        for cov_file, stat_file in zip(input.mean_cov, input.stats):
+            # extract sample name
+            m = re.search(r"qc/([^/]+)\.mean_cov\.txt$", cov_file)
+            sample = m.group(1)
+
+            # read mean coverage
+            with open(cov_file) as cf:
+                cov = float(cf.read().strip())
+
+            # parse seqkit stats for N50
+            with open(stat_file) as sf:
+                header = sf.readline().rstrip("\n").split("\t")
+                data   = sf.readline().rstrip("\n").split("\t")
+
+            try:
+                idx = header.index("N50")
+            except ValueError:
+                raise ValueError(f"N50 column not found in {stat_file}")
+            n50 = float(data[idx])
+
+            # classify sample
+            if cov >= COV_HARD and n50 >= N50_HARD:
+                good.append(sample)
+            else:
+                bad.append(f"{sample}\tcov={cov:.2f}\tN50={n50:.0f}")
+
+        #good samples file containing samples which pass 
+        with open(output.good, "w") as out_good:
+            out_good.write("\n".join(good) + "\n")
+
+        #Failing samples written out
+        with open(output.bad, "w") as out_bad:
+            out_bad.write("\n".join(bad) + "\n")
+
+#Function applied to render the checkpoint filter 
+         
+def get_good_samples():
+    path = checkpoints.filter_samples.get().output[0]
+    with open(path) as f:
+        return [s.strip() for s in f if s.strip()]
+
+
+#----------------------------------------------------------------------------------------------
+#  Rule: Kraken2 for taxonomic identification (minikraken2_v2)
+#----------------------------------------------------------------------------------------------
+rule kraken2_classification:
+    message: "🔬 Classifying reads with Kraken2 (MiniKraken2 v2)"
+    input:
+        read1 = "trimmed/{sample}_1_paired.fastq.gz",
+        read2 = "trimmed/{sample}_2_paired.fastq.gz"
+    output:
+        report     = "kraken2/{sample}.report",
+        classified = "kraken2/{sample}.kraken"
+    threads: 4
+    params:
+        db = "/home/localuser/bioinformatics/tools/minikraken2_v2"
+    shell:
+        """
+        mkdir -p kraken2
+        kraken2 \
+          --db {params.db} \
+          --paired --gzip-compressed {input.read1} {input.read2} \
+          --report {output.report} \
+          --output {output.classified} \
+          --threads {threads}
+        """
+        
+
+
+
+#---------------------------------------------------------------------
+#          CheckM for contaminationand completness check
+#---------------------------------------------------------------------
+rule checkm_quality:
+    input:
+        fasta = "assembly/{sample}/contigs.fasta"
+    output:
+        summary = "checkm/{sample}/checkm_summary.tsv"
+    params:
+        flag = "--reduced_tree"
+    threads: 8
+    shell:
+        """
+        mkdir -p checkm/{wildcards.sample}/bins
+        cp {input.fasta} checkm/{wildcards.sample}/bins/{wildcards.sample}.fasta
+
+        checkm lineage_wf {params.flag} \
+        --extension fasta \
+        --tab_table --file {output.summary} \
+        --threads {threads} \
+        checkm/{wildcards.sample}/bins \
+        checkm/{wildcards.sample}/
+        """
+#Specifying extension so snakemkae does not treat contigs.fasta bin_rr etc as multiple bins 
+#-----------------------------------------------------------
+#                    MLST for sequence typing 
+#----------------------------------------------------------
+rule mlst_typing:
+    message: "🧬 Running MLST for {sample}"
+    input:
+        fasta = "assembly/{sample}/contigs.fasta"
+    output:
+        result = "mlst/{sample}.mlst.tsv"
+    threads: 1
+    shell:
+        """
+        mkdir -p mlst
+        mlst {input.fasta} > {output.result}
+        """
+
+#------------------------------------------------------------
+#                    AMRFinderPlus for resistance gene detection
+#-------------------------------------------------------------
+#Set currently to parse the kraken2 species ID
+rule amrfinder:
+    message: "🧪 Running AMRFinderPlus on {sample}"
+    input:
+        fasta = "assembly/{sample}/contigs.fasta",
+        kraken = "kraken2/{sample}.report"
+    output:
+        results = "amrfinder/{sample}.amrfinder.tsv"
+    threads: 4
+    run:
+        import subprocess
+        import os
+
+        
+        try:
+            grep_cmd = f"grep -P '\\tS\\t' {input.kraken} | head -n 1 | cut -f6 | sed 's/ subsp.*//' | xargs"
+            species = subprocess.check_output(grep_cmd, shell=True).decode().strip()
+        except subprocess.CalledProcessError:
+            species = "Other"
+
+       
+        species_map = {
+            "Enterobacter hormaechei": "Enterobacter cloacae",
+            "Klebsiella aerogenes": "Enterobacter aerogenes",
+            "Citrobacter freundii complex": "Citrobacter freundii",
+            "Citrobacter werkmanii": "Citrobacter freundii",
+            "Citrobacter braakii": "Citrobacter freundii",
+            "Enterobacter bugandensis": "Enterobacter cloacae",
+        }
+        corrected = species_map.get(species, species)
+
+       
+        cpe_species = [
+            "Klebsiella pneumoniae", "Enterobacter cloacae", "Escherichia coli",
+            "Citrobacter freundii", "Klebsiella oxytoca", "Klebsiella variicola",
+            "Enterobacter hormaechei", "Klebsiella quasipneumoniae"
+        ]
+
+        
+        try:
+            supported = subprocess.check_output("amrfinder --list_organisms", shell=True).decode()
+        except subprocess.CalledProcessError:
+            supported = ""
+
+        os.makedirs("amrfinder", exist_ok=True)
+
+     
+        if species in cpe_species and corrected in supported:
+            print(f"✅ Running AMRFinder with --organism '{corrected}' for {wildcards.sample}")
+            shell(f"amrfinder -n {input.fasta} --organism \"{corrected}\" -o {output.results} --threads {threads}")
+        else:
+            print(f"⚠️ Running AMRFinder in generic mode for '{wildcards.sample}' (species: {species})")
+            with open("amrfinder/unsupported_species.txt", "a") as f:
+                f.write(f"{wildcards.sample}\t{species}\n")
+            shell(f"amrfinder -n {input.fasta} -o {output.results} --threads {threads}")
+
+#------------------------------------------------------------
+#                    ABRicate for virulence genes
+#---------------------------------------------------------
+
+rule abricate_amr:
+    message: " Running ABRicate (AMR databases) on {sample}"
+    input:
+        fasta = "assembly/{sample}/contigs.fasta"
+    output:
+        ncbi        = "abricate/ncbi/{sample}.tsv",
+        resfinder   = "abricate/resfinder/{sample}.tsv",
+        vfdb        = "abricate/vfdb/{sample}.tsv",
+        card        = "abricate/card/{sample}.tsv"
+    threads: 2
+    shell:
+        """
+        mkdir -p abricate/ncbi abricate/resfinder abricate/vfdb abricate/card
+
+        abricate --db ncbi {input.fasta}        > {output.ncbi}
+        abricate --db resfinder {input.fasta}   > {output.resfinder}
+        abricate --db vfdb {input.fasta}        > {output.vfdb}
+        abricate --db card {input.fasta}        > {output.card}
+        """
+
+#------------------------------------------------------------------
+#                    Abricate for plasmid finding
+#------------------------------------------------------------------
+rule abricate_plasmid:
+    message: "Running ABRicate (PlasmidFinder) on {sample}"
+    input:
+        fasta = "assembly/{sample}/contigs.fasta"
+    output:
+        tsv = "abricate/plasmidfinder/{sample}.tsv"
+    threads: 2
+    shell:
+        """
+        mkdir -p abricate/plasmidfinder
+        abricate --db plasmidfinder {input.fasta} > {output.tsv}
+        """
+
